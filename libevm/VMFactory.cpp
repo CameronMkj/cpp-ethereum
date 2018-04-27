@@ -20,6 +20,9 @@
 #include "LegacyVM.h"
 #include "interpreter.h"
 
+#include <boost/dll.hpp>
+#include <boost/filesystem.hpp>
+
 #if ETH_EVMJIT
 #include <evmjit.h>
 #endif
@@ -28,7 +31,11 @@
 #include <hera.h>
 #endif
 
+namespace dll = boost::dll;
+namespace fs = boost::filesystem;
 namespace po = boost::program_options;
+
+using evmc_create_fn = evmc_instance*();
 
 namespace dev
 {
@@ -37,6 +44,7 @@ namespace eth
 namespace
 {
 auto g_kind = VMKind::Legacy;
+fs::path g_dllPath;
 
 /// A helper type to build the tabled of VM implementations.
 ///
@@ -63,6 +71,27 @@ VMKindTableEntry vmKindsTable[] = {
 #endif
 };
 
+evmc_instance* createDllEVMC(const fs::path path)
+{
+    static auto createFn = [&] {
+        auto symbols = dll::library_info{path}.symbols();
+        auto it = std::find_if(symbols.begin(), symbols.end(),
+            [](const std::string& symbol) { return symbol.find("evmc_create_") == 0; });
+        if (it == symbols.end())
+        {
+            // This is what boost is doing when symbol not found.
+            auto ec = std::make_error_code(std::errc::invalid_seek);
+            std::string what =
+                "loading " + path.string() + " failed: EVMC create function not found";
+            BOOST_THROW_EXCEPTION(std::system_error(ec, what));
+        }
+
+        return dll::import<evmc_create_fn>(path, *it);
+    }();
+
+    return createFn();
+}
+
 void setVMKind(const std::string& name)
 {
     for (auto& entry : vmKindsTable)
@@ -75,8 +104,14 @@ void setVMKind(const std::string& name)
         }
     }
 
-    BOOST_THROW_EXCEPTION(
-        po::validation_error(po::validation_error::invalid_option_value, "vm", name, 1));
+    fs::path path{name};
+    if (!fs::exists(path))
+    {
+        BOOST_THROW_EXCEPTION(
+            po::validation_error(po::validation_error::invalid_option_value, "vm", name, 1));
+    }
+    g_kind = VMKind::DLL;
+    g_dllPath = std::move(path);
 }
 }
 
@@ -132,7 +167,7 @@ po::options_description vmProgramOptions(unsigned _lineLength)
 
     add("vm",
         po::value<std::string>()
-            ->value_name("<name>")
+            ->value_name("<name>|<path>")
             ->default_value("legacy")
             ->notifier(setVMKind),
         description.data());
@@ -171,6 +206,8 @@ std::unique_ptr<VMFace> VMFactory::create(VMKind _kind)
 #endif
     case VMKind::Interpreter:
         return std::unique_ptr<VMFace>(new EVMC{evmc_create_interpreter()});
+    case VMKind::DLL:
+        return std::unique_ptr<VMFace>(new EVMC{createDllEVMC(g_dllPath)});
     case VMKind::Legacy:
     default:
         return std::unique_ptr<VMFace>(new LegacyVM);
